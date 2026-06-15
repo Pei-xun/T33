@@ -1,0 +1,169 @@
+#define REMOTEXY_MODE__ESP32CORE_BLE
+#include <BLEDevice.h>
+#include <RemoteXY.h>
+
+// ==========================================
+// ===== 1. RemoteXY 連線與介面設定 =====
+// ==========================================
+#define REMOTEXY_BLUETOOTH_NAME "RemoteXY"
+#define REMOTEXY_ACCESS_PASSWORD "12345678"
+
+#pragma pack(push, 1)  
+uint8_t const PROGMEM RemoteXY_CONF_PROGMEM[] =   
+  { 255,1,0,0,0,32,0,19,0,0,0,104,105,0,31,1,106,200,1,1,
+  1,0,2,30,76,44,22,0,2,26,31,31,79,78,0,79,70,0 };
+  
+struct {
+  uint8_t switch_01;    // 手機端開關 (1=ON, 0=OFF)
+  uint8_t connect_flag; // 連線狀態 (1=已連線, 0=未連線)
+} RemoteXY;   
+#pragma pack(pop)
+
+// ==========================================
+// ===== 2. 腳位定義 =====
+// ==========================================
+// 循跡感測器
+#define S1 13 
+#define S2 14 
+#define S3 27 
+#define S4 26 
+#define S5 25 
+
+// 馬達驅動板
+#define IN1 15
+#define IN2 19 
+#define ENA 16 
+#define IN3 18 
+#define IN4 5  
+#define ENB 17 
+
+// ASL 狀態指示燈
+#define LED_R 32
+#define LED_G 4
+#define LED_B 22
+
+// ==========================================
+// ===== 3. ⚙️ 權重與參數調整區 =====
+// ==========================================
+const int LINE_STATE = 0; 
+const int BASE_SPEED = 175; 
+const float Kp = 13.5; 
+const float Kd = 12; 
+const int WEIGHTS[5] = {-28, -14, 0, 14, 28}; 
+const int LOST_LINE_WEIGHT = 30;
+
+int lastError = 0; 
+
+// 宣告函式
+void setMotors(int leftSpeed, int rightSpeed);
+void setASL(int r, int g, int b);
+
+// ==========================================
+// ===== 4. 初始化設定 =====
+// ==========================================
+void setup() {
+  RemoteXY_Init();  
+  
+  // 設定感測器腳位
+  pinMode(S1, INPUT); pinMode(S2, INPUT); pinMode(S3, INPUT); pinMode(S4, INPUT); pinMode(S5, INPUT);
+  
+  // 設定馬達腳位
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+  
+  // 設定 ASL 燈光新版 PWM 初始化 (支援 ESP32 Core 3.0+)
+  ledcAttach(LED_R, 5000, 8);
+  ledcAttach(LED_G, 5000, 8);
+  ledcAttach(LED_B, 5000, 8);
+  
+  setMotors(0, 0);
+  setASL(0, 0, 0);
+}
+
+// ==========================================
+// ===== 5. 主程式迴圈 =====
+// ==========================================
+void loop() { 
+  RemoteXYEngine.handler();   
+  
+  // 【狀態一】檢查藍牙是否中斷連線 (藍燈恆亮 = 其他狀態)
+  if (RemoteXY.connect_flag == 0) {
+    setASL(0, 0, 255); // 藍燈
+    setMotors(0, 0);   // 斷線時馬達強制停止
+  }
+  // 【狀態二】手機已連線，且開關開啟 (紅燈恆亮 = 自主導航)
+  else if (RemoteXY.switch_01 == 1) {
+    setASL(255, 0, 0); // 紅燈
+    
+    // ------ 核心 PID 循跡邏輯 ------
+    bool sensors[5] = {
+      digitalRead(S1) == LINE_STATE,
+      digitalRead(S2) == LINE_STATE,
+      digitalRead(S3) == LINE_STATE,
+      digitalRead(S4) == LINE_STATE,
+      digitalRead(S5) == LINE_STATE
+    };
+
+    int weightSum = 0;
+    int activeCount = 0;
+    int error = 0;
+
+    for (int i = 0; i < 5; i++) {
+      if (sensors[i]) {
+        weightSum += WEIGHTS[i];
+        activeCount++;
+      }
+    }
+
+    if (activeCount > 0) {
+      error = weightSum / activeCount;
+    } else {
+      if (lastError < 0) error = -LOST_LINE_WEIGHT;
+      else if (lastError > 0) error = LOST_LINE_WEIGHT;
+      else error = 0;
+    }
+
+    int derivative = error - lastError; 
+    int turnSpeed = (error * Kp) + (derivative * Kd);
+    
+    lastError = error; 
+    
+    setMotors(BASE_SPEED + turnSpeed, BASE_SPEED - turnSpeed);
+  } 
+  // 【狀態三】手機已連線，但開關關閉 (綠燈恆亮 = 安全狀態)
+  else {
+    setASL(0, 255, 0); // 綠燈
+    setMotors(0, 0);   // 馬達停止
+  }
+}
+
+// ==========================================
+// ===== 6. 功能子程序 =====
+// ==========================================
+
+// 馬達驅動控制
+void setMotors(int leftSpeed, int rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -255, 255);
+  rightSpeed = constrain(rightSpeed, -255, 255);
+
+  if (leftSpeed >= 0) {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); analogWrite(ENA, leftSpeed);
+  } else {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); analogWrite(ENA, -leftSpeed); 
+  }
+
+  if (rightSpeed >= 0) {
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); analogWrite(ENB, rightSpeed);
+  } else {
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); analogWrite(ENB, -rightSpeed); 
+  }
+}
+
+// ASL 燈光控制 (255 = 全亮，0 = 全滅)
+// 備註：如果接線後發現顏色反過來（熄滅變亮、亮變熄滅），代表你的 LED 是共陽極。
+// 到時候只需將下方的函數改為 ledcWrite(LED_R, 255 - r); 即可。
+void setASL(int r, int g, int b) {
+  ledcWrite(LED_R, r);
+  ledcWrite(LED_G, g);
+  ledcWrite(LED_B, b);
+}
